@@ -49,6 +49,41 @@ func (s *Sqlx) Migrate(sqlDB *sql.DB, dialect string) error {
 	return nil
 }
 
+// Rollback will run all rollbacks using the provided db connection.
+func (s *Sqlx) Rollback(sqlDB *sql.DB, dialect string) error {
+	db := sqlx.NewDb(sqlDB, dialect)
+
+	s.printf("Creating/checking migrations table...\n")
+	err := s.createMigrationTable(db)
+	if err != nil {
+		return err
+	}
+	for i := len(s.Migrations) - 1; i >= 0; i-- {
+		m := s.Migrations[i]
+		if m.Rollback == nil {
+			s.printf("Rollback not provided: %v\n", m.ID)
+			continue
+		}
+		var found string
+		err := db.Get(&found, "SELECT id FROM migrations WHERE id=$1", m.ID)
+		switch err {
+		case sql.ErrNoRows:
+			s.printf("Skipping rollback: %v\n", m.ID)
+			continue
+		case nil:
+			s.printf("Running rollback: %v\n", m.ID)
+			// we need to run the rollback so we continue to code below
+		default:
+			return fmt.Errorf("looking up rollback by id: %w", err)
+		}
+		err = s.runRollback(db, m)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Sqlx) printf(format string, a ...interface{}) (n int, err error) {
 	printf := s.Printf
 	if printf == nil {
@@ -89,48 +124,89 @@ func (s *Sqlx) runMigration(db *sqlx.DB, m SqlxMigration) error {
 	return nil
 }
 
+func (s *Sqlx) runRollback(db *sqlx.DB, m SqlxMigration) error {
+	errorf := func(err error) error { return fmt.Errorf("running rollback: %w", err) }
+
+	tx, err := db.Beginx()
+	if err != nil {
+		return errorf(err)
+	}
+	_, err = db.Exec("DELETE FROM migrations WHERE id=$1", m.ID)
+	if err != nil {
+		tx.Rollback()
+		return errorf(err)
+	}
+	err = m.Rollback(tx)
+	if err != nil {
+		tx.Rollback()
+		return errorf(err)
+	}
+	err = tx.Commit()
+	if err != nil {
+		return errorf(err)
+	}
+	return nil
+}
+
 // SqlxMigration is a unique ID plus a function that uses a sqlx transaction
 // to perform a database migration step.
 //
 // Note: Long term this could have a Rollback field if we wanted to support
 // that.
 type SqlxMigration struct {
-	ID      string
-	Migrate func(tx *sqlx.Tx) error
+	ID       string
+	Migrate  func(tx *sqlx.Tx) error
+	Rollback func(tx *sqlx.Tx) error
 }
 
 // SqlxQueryMigration will create a SqlxMigration using the provided id and
 // query string. It is a helper function designed to simplify the process of
 // creating migrations that only depending on a SQL query string.
-func SqlxQueryMigration(id, query string) SqlxMigration {
-	m := SqlxMigration{
-		ID: id,
-		Migrate: func(tx *sqlx.Tx) error {
+func SqlxQueryMigration(id, upQuery, downQuery string) SqlxMigration {
+	queryFn := func(query string) func(tx *sqlx.Tx) error {
+		if query == "" {
+			return nil
+		}
+		return func(tx *sqlx.Tx) error {
 			_, err := tx.Exec(query)
 			return err
-		},
+		}
+	}
+
+	m := SqlxMigration{
+		ID:       id,
+		Migrate:  queryFn(upQuery),
+		Rollback: queryFn(downQuery),
 	}
 	return m
 }
 
 // SqlxFileMigration will create a SqlxMigration using the provided file.
-func SqlxFileMigration(id, filename string) SqlxMigration {
-	f, err := os.Open(filename)
-	if err != nil {
-		// We could return a migration that errors when the migration is run, but I
-		// think it makes more sense to panic here.
-		panic(err)
-	}
-	fileBytes, err := ioutil.ReadAll(f)
-	if err != nil {
-		panic(err)
-	}
-	m := SqlxMigration{
-		ID: id,
-		Migrate: func(tx *sqlx.Tx) error {
+func SqlxFileMigration(id, upFile, downFile string) SqlxMigration {
+	fileFn := func(filename string) func(tx *sqlx.Tx) error {
+		if filename == "" {
+			return nil
+		}
+		f, err := os.Open(filename)
+		if err != nil {
+			// We could return a migration that errors when the migration is run, but I
+			// think it makes more sense to panic here.
+			panic(err)
+		}
+		fileBytes, err := ioutil.ReadAll(f)
+		if err != nil {
+			panic(err)
+		}
+		return func(tx *sqlx.Tx) error {
 			_, err := tx.Exec(string(fileBytes))
 			return err
-		},
+		}
+	}
+
+	m := SqlxMigration{
+		ID:       id,
+		Migrate:  fileFn(upFile),
+		Rollback: fileFn(downFile),
 	}
 	return m
 }

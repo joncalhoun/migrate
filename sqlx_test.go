@@ -33,7 +33,7 @@ func TestSqlx(t *testing.T) {
 				return 0, nil
 			},
 			Migrations: []migrate.SqlxMigration{
-				migrate.SqlxQueryMigration("001_create_courses", createCoursesSql),
+				migrate.SqlxQueryMigration("001_create_courses", createCoursesSql, ""),
 			},
 		}
 		err := migrator.Migrate(db, "sqlite3")
@@ -54,7 +54,7 @@ func TestSqlx(t *testing.T) {
 				return 0, nil
 			},
 			Migrations: []migrate.SqlxMigration{
-				migrate.SqlxQueryMigration("001_create_courses", createCoursesSql),
+				migrate.SqlxQueryMigration("001_create_courses", createCoursesSql, ""),
 			},
 		}
 		err := migrator.Migrate(db, "sqlite3")
@@ -73,8 +73,8 @@ func TestSqlx(t *testing.T) {
 				return 0, nil
 			},
 			Migrations: []migrate.SqlxMigration{
-				migrate.SqlxQueryMigration("001_create_courses", createCoursesSql),
-				migrate.SqlxQueryMigration("002_create_users", createUsersSql),
+				migrate.SqlxQueryMigration("001_create_courses", createCoursesSql, ""),
+				migrate.SqlxQueryMigration("002_create_users", createUsersSql, ""),
 			},
 		}
 		err = migrator.Migrate(db, "sqlite3")
@@ -95,7 +95,7 @@ func TestSqlx(t *testing.T) {
 				return 0, nil
 			},
 			Migrations: []migrate.SqlxMigration{
-				migrate.SqlxFileMigration("001_create_widgets", "testdata/widgets.sql"),
+				migrate.SqlxFileMigration("001_create_widgets", "testdata/widgets.sql", ""),
 			},
 		}
 		err := migrator.Migrate(db, "sqlite3")
@@ -107,16 +107,68 @@ func TestSqlx(t *testing.T) {
 			t.Fatalf("db.Exec() err = %v; want nil", err)
 		}
 	})
+
+	t.Run("rollback", func(t *testing.T) {
+		db := sqliteInMem(t)
+		migrator := migrate.Sqlx{
+			Printf: func(format string, args ...interface{}) (int, error) {
+				t.Logf(format, args...)
+				return 0, nil
+			},
+			Migrations: []migrate.SqlxMigration{
+				migrate.SqlxQueryMigration("001_create_courses", createCoursesSql, dropCoursesSql),
+			},
+		}
+		err := migrator.Migrate(db, "sqlite3")
+		if err != nil {
+			t.Fatalf("Migrate() err = %v; want nil", err)
+		}
+		_, err = db.Exec("INSERT INTO courses (name) VALUES ($1) ", "cor_test")
+		if err != nil {
+			t.Fatalf("db.Exec() err = %v; want nil", err)
+		}
+		err = migrator.Rollback(db, "sqlite3")
+		if err != nil {
+			t.Fatalf("Rollback() err = %v; want nil", err)
+		}
+		var count int
+		err = db.QueryRow("SELECT COUNT(id) FROM courses;").Scan(&count)
+		if err == nil {
+			// Want an error here
+			t.Fatalf("db.QueryRow() err = nil; want table missing error")
+		}
+		// Don't want to test inner workings of lib, so let's just migrate again and verify we have a table now
+		err = migrator.Migrate(db, "sqlite3")
+		if err != nil {
+			t.Fatalf("Migrate() err = %v; want nil", err)
+		}
+		_, err = db.Exec("INSERT INTO courses (name) VALUES ($1) ", "cor_test")
+		if err != nil {
+			t.Fatalf("db.Exec() err = %v; want nil", err)
+		}
+		err = db.QueryRow("SELECT COUNT(*) FROM courses;").Scan(&count)
+		if err != nil {
+			// Want an error here
+			t.Fatalf("db.QueryRow() err = %v; want nil", err)
+		}
+		if count != 1 {
+			t.Fatalf("count = %d; want %d", count, 1)
+		}
+	})
 }
 
-var createCoursesSql = `
+var (
+	createCoursesSql = `
 CREATE TABLE courses (
   id serial PRIMARY KEY,
   name text
 );`
+	dropCoursesSql = `DROP TABLE courses;`
 
-var createUsersSql = `
+	createUsersSql = `
 CREATE TABLE users (
   id serial PRIMARY KEY,
   email text UNIQUE NOT NULL
 );`
+	dropUsersSql = `DROP TABLE users;`
+)
